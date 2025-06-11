@@ -14,48 +14,22 @@ import (
 )
 
 const (
-	openaiEndpoint    = "https://api.openai.com/v1/chat/completions"
-	model             = "gpt-4"
-	maxFilesToAnalyze = 10
-	maxCharsPerFile   = 8000
-	basePrompt        = `You are a CockroachDB expert. Analyze the following file and identify
-		inefficiences and anti-patterns. List up to three things. Only include suggestions
-		that you are highly confident in being relevant to query performance. Include only the list
-		not any summary text beforehand.\n`
+	openaiEndpoint = "https://api.openai.com/v1/chat/completions"
+	model          = "gpt-4"
+	basePrompt     = `You are a CockroachDB expert. Analyze the following
+		files and identify inefficiences and anti-patterns. Only include
+		suggestions that you are highly confident in being relevant to query
+		performance. Include only the list not any summary text beforehand.
+
+		* What are the slowest operations as shown in the plan?
+		* What are the most common anti-patterns in the schema?
+		* What are the most common anti-patterns in the query?
+		* What missing indexes might speed up this query?
+	`
 )
 
-var prompts = map[string]string{
-	"env.sql": basePrompt +
-		`Here is the environment file. Answer the following questions if relevant:
-		* What version of CockroachDB is being used?
-		* What non-default settings are configured?`,
-	"plan.txt": basePrompt +
-		`Here is the plan.txt file. Answer the following questions if relevant:
-		* What are the slowest operations as shown in the plan?
-		* What missing indexes might speed up this query?`,
-	"statement.sql": basePrompt +
-		`Here is the statement file. Answer the following questions if relevant:
-		* What are the most common anti-patterns in the query?`,
-	"schema.sql": basePrompt +
-		`Here is the schema file. Answer the following questions if relevant:
-		* What are the most common anti-patterns in the schema?`,
-}
-
-type ChatRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-}
-
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ChatResponse struct {
-	Choices []struct {
-		Message ChatMessage `json:"message"`
-	} `json:"choices"`
-}
+// fileNames is the list of files to use for analysis.
+var fileNames = [...]string{"schema.sql", "statement.sql", "plan.txt"}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -73,22 +47,13 @@ func main() {
 		log.Fatalf("Failed to unzip: %v", err)
 	}
 
-	relevant := extractRelevantFiles(files)
-
-	for i, file := range relevant {
-		fmt.Printf("🔍 Analyzing file %d of %d: %s...\n\n", i+1, len(relevant), file.Name)
-		summary, err := analyzeFile(file.Name, file.Content)
-		if err != nil {
-			log.Printf("Error analyzing %s: %v", file.Name, err)
-			continue
-		}
-		fmt.Printf("\033[1mSummary for %s:\033[0m\n\n%s\n\n\n", file.Name, summary)
+	fmt.Printf("🔍 Analyzing statement bundle...\n\n")
+	prompt := buildPrompt(files)
+	response, err := sendToChatGPT(prompt)
+	if err != nil {
+		log.Fatalf("API error: %v\n", err)
 	}
-}
-
-type NamedFile struct {
-	Name    string
-	Content string
+	fmt.Print(response)
 }
 
 func unzipInMemory(zipData []byte) (map[string]string, error) {
@@ -119,29 +84,32 @@ func unzipInMemory(zipData []byte) (map[string]string, error) {
 	return files, nil
 }
 
-func extractRelevantFiles(files map[string]string) []NamedFile {
-	selected := make([]NamedFile, 0, maxFilesToAnalyze)
-	for name, content := range files {
-		if _, ok := prompts[name]; !ok {
-			continue
-		}
-
-		if len(content) > maxCharsPerFile {
-			content = content[:maxCharsPerFile] + "\n... [truncated]"
-		}
-
-		selected = append(selected, NamedFile{Name: name, Content: content})
-
-		if len(selected) >= maxFilesToAnalyze {
-			break
+func buildPrompt(files map[string]string) string {
+	var buf bytes.Buffer
+	buf.WriteString(basePrompt)
+	for _, name := range fileNames {
+		if content, ok := files[name]; ok {
+			buf.WriteString(content)
+			buf.WriteByte('\n')
 		}
 	}
-	return selected
+	return buf.String()
 }
 
-func analyzeFile(name, content string) (string, error) {
-	prompt := prompts[name] + "\n\n" + content
-	return sendToChatGPT(prompt)
+type request struct {
+	Model    string    `json:"model"`
+	Messages []message `json:"messages"`
+}
+
+type message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type response struct {
+	Choices []struct {
+		Message message `json:"message"`
+	} `json:"choices"`
 }
 
 func sendToChatGPT(prompt string) (string, error) {
@@ -150,9 +118,9 @@ func sendToChatGPT(prompt string) (string, error) {
 		return "", fmt.Errorf("OPENAI_API_KEY not set")
 	}
 
-	reqBody := ChatRequest{
+	reqBody := request{
 		Model: model,
-		Messages: []ChatMessage{
+		Messages: []message{
 			{Role: "system", Content: "You are a database performance expert."},
 			{Role: "user", Content: prompt},
 		},
@@ -183,7 +151,7 @@ func sendToChatGPT(prompt string) (string, error) {
 		return "", fmt.Errorf("API call failed: %s", bodyBytes)
 	}
 
-	var chatResp ChatResponse
+	var chatResp response
 	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
 		return "", err
 	}
